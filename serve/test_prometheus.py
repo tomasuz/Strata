@@ -31,9 +31,10 @@ def parse(text):
             continue
         if line.startswith("#") or not line:
             continue
-        m = re.fullmatch(r'([a-z0-9_:]+)\{([^}]*)\} (\S+)', line)
+        m = re.fullmatch(r'([a-z0-9_:]+)(?:\{([^}]*)\})? (\S+)', line)
         assert m, f"not a sample line: {line!r}"
         name, labels, value = m.groups()
+        labels = labels or ""   # llama-server's lines (svc.prometheus(), now also on /metrics) carry none
         family = re.sub(r"_(bucket|sum|count)$", "", name)
         assert name in typed or family in typed, f"{name} has no # TYPE"
         out[(name, labels)] = float(value)
@@ -128,6 +129,9 @@ class Endpoint(unittest.TestCase):
         self.assertGreaterEqual(got["vllm:request_success_total"], 1)
         self.assertGreaterEqual(got["vllm:generation_tokens_total"], usage["completion_tokens"])
         self.assertGreaterEqual(got["vllm:e2e_request_latency_seconds_count"], 1)
+        # llama-server's names ride along in the same response (svc.prometheus(), same as /metrics/prometheus),
+        # so a dashboard built for either server finds its names at the one /metrics URL
+        self.assertGreaterEqual(got["llamacpp:tokens_predicted_total"], usage["completion_tokens"])
         ctype, text = self.get("/metrics", "application/json")
         self.assertTrue(ctype.startswith("application/json"))
         self.assertGreaterEqual(json.loads(text)["totals"]["requests"], 1)
