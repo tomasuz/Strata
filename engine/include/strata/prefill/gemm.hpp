@@ -57,6 +57,7 @@ public:
     /// X's padded row stride, taken only by STRATA_PF_PAD's path (0 = K).
     /// On an MMQ build a beta = 0 product whose type is covered, whose K is a multiple of 256 values and whose matrix fits
     /// the card's shared memory runs through llama.cpp's int8 MMQ instead (opt-in: STRATA_DENSE_MMQ=1).
+    /// On HIP gfx12 with STRATA_PF_W8A8=1 a chunk of 256+ rows runs as an int8 x int8 GEMM (native_w8a8; not bit-exact).
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0, float beta = 0.0f, int64_t ldx = 0);
 
@@ -142,6 +143,16 @@ private:
     void* mmq_ctx_ = nullptr;
     void* mmq_buf_ = nullptr;
     bool mmq_failed_ = false;
+    /// STRATA_PF_W8A8=1 (HIP gfx12, opt-in): native()'s product as int8 x int8 (w8a8_gemm.hpp); false: not taken.  w8_buf_ holds
+    /// the requantized weight, x8_buf_ a chunk of quantized activation rows, both grown as needed.
+    bool native_w8a8(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
+                     int64_t ldy, float beta);
+    void* w8_buf_ = nullptr;
+    size_t w8_bytes_ = 0;
+    void* x8_buf_ = nullptr;
+    size_t x8_bytes_ = 0;
+    bool w8a8_failed_ = false;
+    bool w8a8_logged_ = false;
     /// Y = X . W^T with FP16 out, written into Y's own rows and widened there (no buffer): prompt_f16() only.
     void f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy);
 };

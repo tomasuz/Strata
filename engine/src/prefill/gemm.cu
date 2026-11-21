@@ -9,6 +9,7 @@
 
 #ifdef STRATA_USE_HIP
 #include "wmma_gemm.h"
+#include "strata/prefill/w8a8_gemm.hpp"
 #endif
 
 #include <cublas_v2.h>
@@ -699,6 +700,8 @@ Gemm::~Gemm() {
     if (tc_w_) cudaFree(tc_w_);
     if (tc_x_) cudaFree(tc_x_);
     if (unpadded_x_) cudaFree(unpadded_x_);
+    if (w8_buf_) cudaFree(w8_buf_);
+    if (x8_buf_) cudaFree(x8_buf_);
     if (!external_) {
         if (scratch_) cudaFree(scratch_);
         if (workspace_) cudaFree(workspace_);
@@ -1418,6 +1421,87 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
 #endif
 }
 
+#ifdef STRATA_USE_HIP
+// STRATA_PF_W8A8=1 (gfx12 / RDNA4, opt-in): Y = beta Y + X . W^T as an int8 x int8 GEMM (src/prefill/w8a8_gemm.cu, radiance's
+// r4d_gemm_w8a8_tiled; the gfx12 int8 WMMA runs about twice the FP16 rate).  The weight is dequantized to FP16 in the scratch as on
+// the FP16 path, then requantized to int8 with an FP16 scale per (row, 128 values of K) into w8_buf_; the activation is quantized
+// to int8 per row (STRATA_PF_W8A8_AG=0) or per (row, 32 / 128 values) (=32 / =128, the default) into x8_buf_, in chunks of rows
+// (at most STRATA_PF_W8A8_X_MIB, default 64 MiB of int8).  NOT the FP16 product's bits: the int8 rounding of both operands (a
+// relative L2 error of about 1e-2 on synthetic data, w8a8_gemm_parity).  Chunks shorter than STRATA_PF_W8A8_MIN_T (default 256)
+// rows, shapes the kernels do not cover, another card, or a failed allocation: false, and the FP16 path runs.
+bool Gemm::native_w8a8(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
+                       int64_t ldy, float beta) {
+    namespace w8 = strata::prefill::w8a8;
+    static const bool on = [] { const char* v = std::getenv("STRATA_PF_W8A8"); return v && v[0] == '1'; }();
+    if (!on || w8a8_failed_ || f16_io_) return false;
+    static const int ag = [] {
+        const char* v = std::getenv("STRATA_PF_W8A8_AG");
+        const int a = v ? std::atoi(v) : 128;
+        return (a == 0 || a == 32 || a == 128) ? a : 128;
+    }();
+    static const int64_t min_t = [] { const char* v = std::getenv("STRATA_PF_W8A8_MIN_T"); return v ? (int64_t) std::atoll(v) : (int64_t) 256; }();
+    static const int64_t x_cap = [] {
+        const char* v = std::getenv("STRATA_PF_W8A8_X_MIB");
+        const int64_t m = v ? (int64_t) std::atoll(v) : 64;
+        return (m > 0 ? m : 64) << 20;
+    }();
+    if (T < min_t || beta != 0.0f && beta != 1.0f) return false;
+    if (K % w8::kGroup != 0 || (ag > 0 && K % ag != 0) || w8::default_tile(T, N) < 0) return false;
+    if (N * K > scratch_elems_) return false;   // the weight's FP16 image in the scratch at once
+    if (!w8::available()) return false;
+    if (ldy <= 0) ldy = N;
+
+    const auto up = [](size_t v) { return (v + 255) & ~(size_t) 255; };
+    int64_t R = x_cap / K;
+    if (R < 256) R = 256;
+    if (R > T) R = T;
+    const size_t w_need = up(w8::wq_bytes(N, K)) + w8::ws_bytes(N, K);
+    const size_t x_need = up(w8::xq_bytes(R, K)) + w8::xs_bytes(R, K, ag);
+    const auto grow8 = [&](void*& p, size_t& have, size_t want) {
+        if (have >= want) return true;
+        if (p) (void) cudaFree(p);
+        p = nullptr;
+        have = 0;
+        if (cudaMalloc(&p, want) != cudaSuccess) {
+            (void) cudaGetLastError();
+            p = nullptr;
+            return false;
+        }
+        have = want;
+        return true;
+    };
+    if (!grow8(w8_buf_, w8_bytes_, w_need) || !grow8(x8_buf_, x8_bytes_, x_need)) {
+        std::fprintf(stderr, "prefill gemm: STRATA_PF_W8A8: no device memory for the int8 buffers (%.1f + %.1f MiB): FP16 path\n",
+                     w_need / 1048576.0, x_need / 1048576.0);
+        w8a8_failed_ = true;
+        return false;
+    }
+    if (!w8a8_logged_) {
+        w8a8_logged_ = true;
+        std::fprintf(stderr, "prefill gemm: int8 x int8 dense projections on (STRATA_PF_W8A8=1, activation scale %s, chunks >= %lld rows)\n",
+                     ag == 0 ? "per row" : ag == 32 ? "per 32 values" : "per 128 values", (long long) min_t);
+    }
+    uint8_t* wq = (uint8_t*) w8_buf_;
+    uint8_t* ws = wq + up(w8::wq_bytes(N, K));
+    uint8_t* xq = (uint8_t*) x8_buf_;
+    float* xs = (float*) (xq + up(w8::xq_bytes(R, K)));
+    strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
+    if (!w8::requant_f16(scratch_, K, N, K, wq, ws, stream_)) {
+        // not launched (shape checked above): the FP16 image is in the scratch, so run the FP16 product on it
+        f16(X, scratch_, Y, T, N, K, ldy, beta);
+        return true;
+    }
+    for (int64_t r0 = 0; r0 < T; r0 += R) {
+        const int64_t rows = (T - r0 < R) ? T - r0 : R;
+        if (!w8::quant_act_f16(X + r0 * K, K, rows, K, ag, xq, xs, stream_) ||
+            !w8::gemm(xq, xs, ag, wq, ws, Y + r0 * ldy, rows, N, K, ldy, beta, stream_)) {
+            // a short last chunk no tile covers: its rows on the FP16 product (the weight's FP16 image is still in the scratch)
+            f16(X + r0 * K, scratch_, Y + r0 * ldy, rows, N, K, ldy, beta);
+        }
+    }
+    return true;
+}
+#endif
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                   int64_t ldy, float beta, int64_t ldx) {
 #ifdef STRATA_USE_HIP
@@ -1515,6 +1599,10 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         if (dctx.used_scratch && dctx.side_free)
             (void) cudaEventRecord((cudaEvent_t) dctx.side_free, (cudaStream_t) stream_);
     }
+#endif
+#ifdef STRATA_USE_HIP
+    // STRATA_PF_W8A8=1 (gfx12, opt-in): the product as int8 x int8 on the matrix cores (native_w8a8); false: the paths below
+    if ((ldx == 0 || ldx == K) && native_w8a8(X, ggml_type, W_blocks, Y, T, N, K, ldy, beta)) return;
 #endif
 #ifndef STRATA_USE_HIP
     // The FP16 weight kept on the device after its first dequant.  NOT bit-exact against the uncached sliced form on every

@@ -89,6 +89,12 @@ macro(strata_hip_prompt_tests)
     add_test(NAME hip_prefill_expert_paths_bench COMMAND hip_prefill_expert_paths_bench --quick)
     set_tests_properties(hip_prefill_expert_paths_bench PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     list(APPEND _strata_hip_tests hip_prefill_expert_paths_bench)
+    # the gfx12 int8 GEMM (src/prefill/w8a8_gemm.cu) against FP64 on the dense prompt shapes; --bench adds timings vs hipBLAS FP16 (exit 77 off gfx12)
+    add_executable(w8a8_gemm_parity src/prefill/w8a8_gemm_parity.cu)
+    target_link_libraries(w8a8_gemm_parity PRIVATE strata_prefill strata_hip_runtime)
+    add_test(NAME w8a8_gemm_parity COMMAND w8a8_gemm_parity)
+    set_tests_properties(w8a8_gemm_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+    list(APPEND _strata_hip_tests w8a8_gemm_parity)
     # the hyper-connection read's fused up projection + mix (gr_upmix, STRATA_HC_UPMIX) on gfx11: BF16 images against the default pair, and the FP16 prompt
     # path's FP16 images (STRATA_HIP_PROMPT_F16=1) against the FP64 reference; exit 77 off gfx11 / without a card
     set_source_files_properties(src/prefill/gr_upmix_parity.cu PROPERTIES LANGUAGE HIP INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")
