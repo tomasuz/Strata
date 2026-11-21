@@ -1,0 +1,6 @@
+Strata
+
+engine/bench/micro/w8a8_gfx12_bench.hip contains code adapted from radiance
+(https://codeberg.org/StillDeadcode/radiance), Copyright StillDeadcode,
+licensed under the Apache License, Version 2.0:
+https://www.apache.org/licenses/LICENSE-2.0
