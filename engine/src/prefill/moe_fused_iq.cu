@@ -2514,7 +2514,7 @@ template <int WT, bool GU, int BN, bool D16 = false>
 __global__ void __launch_bounds__(f16::THREADS)
 native_f16_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_t* __restrict__ act,
                   const int32_t* __restrict__ src, uint8_t* __restrict__ out, float* __restrict__ dm) {
-#if STRATA_F16_DEVICE
+#if STRATA_F16_DEVICE || STRATA_F16_W12
     // (moe_fused_iq.cu has its own THREADS and AB: the f16 names are qualified where they collide)
     using namespace f16;
     constexpr int NS = (GU ? GU_ROWS_K : D_ROWS_K) / 64;  // 64-value stages along K
@@ -2589,6 +2589,36 @@ native_f16_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
     // int8 codes to F16 per wave (gufo's Q8_0 decode): the sign bit flipped carries q + 128, a byte permute makes it
     // the mantissa of 1024 (exact), minus 1152 is q, then one packed multiply by the sub-block's scale
     const __half2 magic = __floats2half2_rn(-1152.0f, -1152.0f), zero2 = __floats2half2_rn(0.0f, 0.0f);
+#if STRATA_F16_W12
+    // gfx12: lane half hi converts only the K it holds, 8 hi .. 8 hi + 7 of each 16 (half the gfx11 lane's work)
+    const int hi = (tid & 31) >> 4;
+    const auto compute_stage = [&]() {
+        const int row = wave * 16 + sub_lane;
+        const uint8_t* wb = s_w + row * WLD8 + 8 * hi;
+#pragma unroll
+        for (int kb = 0; kb < 2; ++kb) {
+            const uint2 c0 = *reinterpret_cast<const uint2*>(wb + 32 * kb);        // K 8 hi .. + 7 (s0)
+            const uint2 c1 = *reinterpret_cast<const uint2*>(wb + 32 * kb + 16);   // K 16 + 8 hi .. + 7 (s1)
+            const __half2 sc = __builtin_bit_cast(__half2, s_sc[kb * ROWS + row]);
+            const __half2 sc0 = __low2half2(sc), sc1 = __high2half2(sc);
+            const uint32_t words[4] = {c0.x, c0.y, c1.x, c1.y};
+            uint32_t hw[8];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const uint32_t c = words[i] ^ 0x80808080u;
+                const uint32_t p0 = __builtin_amdgcn_perm(c, 0x64646464u, 0x01050004u);
+                const uint32_t p1 = __builtin_amdgcn_perm(c, 0x64646464u, 0x03070206u);
+                const __half2 s2 = i < 2 ? sc0 : sc1;
+                hw[2 * i] = __builtin_bit_cast(uint32_t, __hfma2(__hadd2(__builtin_bit_cast(__half2, p0), magic), s2, zero2));
+                hw[2 * i + 1] = __builtin_bit_cast(uint32_t, __hfma2(__hadd2(__builtin_bit_cast(__half2, p1), magic), s2, zero2));
+            }
+            v8h a_lo, a_hi;
+            __builtin_memcpy(&a_lo, &hw[0], 16);
+            __builtin_memcpy(&a_hi, &hw[4], 16);
+            mma_tiles_w12<BN>(acc, a_lo, a_hi, s_act, kb, sub_lane, hi, live_tiles);
+        }
+    };
+#else
     const auto compute_stage = [&]() {
         const int row = wave * 16 + sub_lane;
         const uint4* wp = reinterpret_cast<const uint4*>(s_w + row * WLD8);
@@ -2614,6 +2644,7 @@ native_f16_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
             mma_tiles<BN>(acc, a_lo, a_hi, s_act, kb, sub_lane, live_tiles);
         }
     };
+#endif
     fetch_stage(0);
     for (int s = 0; s < NS; ++s) {
         commit_stage();
@@ -3760,12 +3791,14 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         uint8_t* ha8 = (uint8_t*) ha;
 #define STRATA_NW_GU(T) do { if (occ_gu) native_w11_kernel<T, true, true, NW_LB><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr); else native_w11_kernel<T, true><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr); } while (0)
         // STRATA_PF_F16=1: gfx11's F16 matrix cores - the K-quants' kernels (moe_f16_kq.cu) and native_f16_kernel for
-        // f16_gu / f16_d (gfx12's WMMA layout differs, so it keeps the int8 kernels)
-        const bool f16 = !d.w12 && f16::requested();
+        // f16_gu / f16_d.  gfx12 (RDNA4): native_f16_kernel with gfx12's fragments (STRATA_F16_W12) for f16_gu / f16_d only;
+        // the K-quant kernels (f16kq) are gfx11's and keep the int8 kernels there.
+        const bool f16 = f16::requested();
+        const bool f16kq_on = f16 && !d.w12;
         const bool f16_q8d = !f16 && g.d_type == T_Q8_0 && q8d_f16_default(d);   // (the Q8_0 down only)
         const bool f16_wide = f16::pick_bn(n, n_expert) == 2 * kTileRows;
         // STRATA_PF_DM16 (the prompt path asks per call): when this layer's down runs on an F16 kernel its rows go to `dm` as FP16 (moe_combine16 reads them)
-        const bool d16 = g_dm16_want && ((f16 && (f16kq::covers_down(g.d_type) || f16_d(g.d_type))) || f16_q8d);
+        const bool d16 = g_dm16_want && ((f16kq_on && f16kq::covers_down(g.d_type)) || (f16 && f16_d(g.d_type)) || f16_q8d);
         g_dm16_used = d16;
 #define STRATA_F16_LAUNCH(T, GU, NFB, ACT, OUT, DM) do { \
     const unsigned grid_f = (unsigned) std::max<int64_t>(1, tiles * (NFB)); \
@@ -3775,7 +3808,7 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
     } else if (f16_wide) native_f16_kernel<T, GU, 2 * kTileRows><<<grid_f, f16::THREADS, 0, s>>>(b, g, tb, ACT, src, OUT, DM); \
     else native_f16_kernel<T, GU, kTileRows><<<grid_f, f16::THREADS, 0, s>>>(b, g, tb, ACT, src, OUT, DM); \
 } while (0)
-        if (f16 && f16kq::covers(g.gu_type)) f16kq::gate_up(b, g, tb.ts, tb.tiles, tb.off, n, n_expert, tiles, xa8, src, ha8, s);
+        if (f16kq_on && f16kq::covers(g.gu_type)) f16kq::gate_up(b, g, tb.ts, tb.tiles, tb.off, n, n_expert, tiles, xa8, src, ha8, s);
         else if (f16 && f16_gu(g.gu_type)) {
 #define STRATA_F16_GU(T) STRATA_F16_LAUNCH(T, true, f16::GU_NFB, xa8, ha8, nullptr)
             switch (g.gu_type) {
@@ -3808,7 +3841,7 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         }
 #undef STRATA_NW_GU
 #define STRATA_NW_D(T) do { if (occ_d) native_w11_kernel<T, false, true, NW_LB><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); else native_w11_kernel<T, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); } while (0)
-        if (f16 && f16kq::covers_down(g.d_type)) f16kq::down(b, g, tb.ts, tb.tiles, tb.off, n, n_expert, tiles, ha8, dm, s, d16);
+        if (f16kq_on && f16kq::covers_down(g.d_type)) f16kq::down(b, g, tb.ts, tb.tiles, tb.off, n, n_expert, tiles, ha8, dm, s, d16);
         else if ((f16 && f16_d(g.d_type)) || f16_q8d) {
             if (g.d_type == T_Q2_0) STRATA_F16_LAUNCH(T_Q2_0, false, f16::D_NFB, ha8, nullptr, dm);
             else if (g.d_type == T_Q8_0) STRATA_F16_LAUNCH(T_Q8_0, false, f16::D_NFB, ha8, nullptr, dm);

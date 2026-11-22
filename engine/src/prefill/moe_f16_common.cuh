@@ -41,6 +41,20 @@
 #else
 #define STRATA_F16_DEVICE 0
 #endif
+// gfx12 (RDNA4): native_f16_kernel only (the K-quant kernels of moe_f16_kq.cu stay gfx11).  gfx12's F16 WMMA takes 8
+// halves a lane (lanes 0-15 K 0-7, lanes 16-31 K 8-15 of the same 16 rows / columns) and its accumulator holds rows
+// i + 8 * (lane / 16), where gfx11 takes all 16 K in every lane and holds rows 2 i + lane / 16.
+#if defined(__HIPCC__) && (defined(__gfx1200__) || defined(__gfx1201__))
+#define STRATA_F16_W12 1
+#else
+#define STRATA_F16_W12 0
+#endif
+// the weight row (within a wave's 16) of accumulator element l of lane half `half`
+#if STRATA_F16_W12
+#define STRATA_F16_CROW(l, half) ((l) + 8 * (half))
+#else
+#define STRATA_F16_CROW(l, half) (2 * (l) + (half))
+#endif
 
 namespace strata::prefill::fused::f16 {
 
@@ -82,6 +96,18 @@ __device__ __forceinline__ v8f wmma_f16(v16h a, v16h b, v8f c) {
 #if STRATA_F16_DEVICE
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
 #else
+    __builtin_trap();
+    return c;
+#endif
+}
+
+using v8h = __attribute__((__vector_size__(8 * sizeof(_Float16)))) _Float16;
+
+__device__ __forceinline__ v8f wmma_f16_w12(v8h a, v8h b, v8f c) {
+#if STRATA_F16_W12
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+#else
+    (void) a; (void) b;
     __builtin_trap();
     return c;
 #endif
@@ -174,6 +200,26 @@ __device__ __forceinline__ void mma_tiles(v8f (&acc)[BN / 16], v16h a_lo, v16h a
     }
 }
 
+/// gfx12: the same two WMMAs (K 32) with gfx12's fragments - lane half `hi` holds K 8 hi .. 8 hi + 7 of each 16, so a
+/// lane reads the staged chunks kb * 4 + hi (K 0-15) and kb * 4 + 2 + hi (K 16-31) of its token column.
+template <int BN>
+__device__ __forceinline__ void mma_tiles_w12(v8f (&acc)[BN / 16], v8h a_lo, v8h a_hi, const uint4* s_act, int kb, int sub_lane,
+                                              int hi, int live_tiles) {
+    constexpr int STRIDE = ActStage<BN>::STRIDE;
+#pragma unroll
+    for (int j = 0; j < BN / 16; ++j) {
+        asm volatile("" ::: "memory");
+        if (j >= live_tiles) continue;
+        const uint4* frag = s_act + (kb * 4 + hi) * STRIDE + j * 16 + sub_lane;
+        const uint4 q0 = frag[0], q1 = frag[2 * STRIDE];
+        v8h b_lo, b_hi;
+        __builtin_memcpy(&b_lo, &q0, 16);
+        __builtin_memcpy(&b_hi, &q1, 16);
+        acc[j] = wmma_f16_w12(a_lo, b_lo, acc[j]);
+        acc[j] = wmma_f16_w12(a_hi, b_hi, acc[j]);
+    }
+}
+
 constexpr int GU_EPI_STRIDE = 18, GU_EPI_PLANE = 16 * GU_EPI_STRIDE;
 constexpr int GU_EPI_BYTES = 8 * GU_EPI_PLANE * 4, D_EPI_BYTES = 8 * 256 * 4;
 
@@ -190,7 +236,7 @@ __device__ __forceinline__ void gu_epilogue(const v8f (&acc)[BN / 16], uint8_t* 
     for (int j = 0; j < BN / 16; ++j) {
         if (j >= live_tiles) break;   // uniform
 #pragma unroll
-        for (int l = 0; l < 8; ++l) scratch[sub_lane * GU_EPI_STRIDE + 2 * l + half_id] = acc[j][l];
+        for (int l = 0; l < 8; ++l) scratch[sub_lane * GU_EPI_STRIDE + STRATA_F16_CROW(l, half_id)] = acc[j][l];
         __syncthreads();
         if (tid < 32) {
             const int t = tid >> 1, hh = tid & 1, r = j * 16 + t;
@@ -240,7 +286,7 @@ __device__ __forceinline__ void down_epilogue(const v8f (&acc)[BN / 16], uint8_t
     for (int j = 0; j < BN / 16; ++j) {
         if (j >= live_tiles) break;   // uniform
 #pragma unroll
-        for (int l = 0; l < 8; ++l) tile[sub_lane * 16 + 2 * l + half_id] = acc[j][l];
+        for (int l = 0; l < 8; ++l) tile[sub_lane * 16 + STRATA_F16_CROW(l, half_id)] = acc[j][l];
         __builtin_amdgcn_wave_barrier();
 #pragma unroll
         for (int q = 0; q < 8; ++q) {
