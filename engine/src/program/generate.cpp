@@ -5403,6 +5403,7 @@ int main(int argc, char** argv) {
             o.pcie_frac_auto = (o.layer_split.empty() || pcie_auto_split_ok()) && !pf_old &&
                                (decode_defaults_arch_ok() || pcie_auto_fork_arch_ok());
             o.pcie_probe_gbps = bw;
+            strata::prefill::Prefill::set_link_gbps(bw);   // the prompt ring's depth on a slow link (gfx12, prefill.cpp)
         } else {
             o.pcie_frac = base;
             std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);

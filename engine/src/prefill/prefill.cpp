@@ -761,6 +761,7 @@ double g_pinned_share = 1.0;
 // slot count is derived from the pack (`ring_budget_slots`); Q2_0 still resolves to exactly 1024 (fused) and 384,
 // so the pack all of this was tuned on does not move.
 int g_ring_override = 0;   // #340: set by a layer split (Prefill::set_ring_override); 0 = the rule below
+double g_link_gbps = 0.0;  // the start-up host -> device probe (Prefill::set_link_gbps, GB/s); 0 = not probed
 // #583 (0.1.39b): the auto chunk scan's byte-budget ring (Prefill::set_ring_budget), for requests whose chunk is above
 // g_ring_small_max - the chunk 0.1.39's rule would have picked.  A prompt that fits that chunk keeps 0.1.39's ring:
 // on one chunk the smaller ring only slowed it (RTX 5070, 4K prompts: Coder -15%, IQ3_S -5%, IQ3_XXS -2%).
@@ -840,6 +841,40 @@ inline int ring_budget_slots() {
     const int cap = ring_cap();
     return (int) (n <= 0 ? 0 : (n > cap ? cap : n));
 }
+// gfx12 on a slow host link: the ring for chunks that stream every expert (ring_slots below; 0 = keep 96).  The 96-slot
+// ring of the matrix-core attention was measured on an R9700 behind a fast link.  On an RX 9060 XT (gfx1200) behind
+// PCIe 3.0 x16 (13.4 GB/s probed), IQ3_S pack, a 32K prompt in two 16K chunks, per-layer GPU timestamps showed that
+// 96 slots (a fifth of a layer's ~470 streamed experts) let a layer's copies start only as the previous layer's
+// expert GEMM frees slots: the expert phase waits on the link (wait copy 0.8-2.0 s), and a faster expert kernel
+// (STRATA_PF_F16=1, -26% expert phase) only moved its time into that wait.  With one layer's experts in the ring
+// (ring_cap(): 512 slots, ~1.3 GiB) the copies run during the layer's attention / GDN work: wait copy 0.01-0.05 s,
+// prompt tok/s 1529 / 1534 -> 1695 / 1644 with STRATA_PF_F16=1 (int8: 1511 -> 1564), the same tokens; the loan
+// grows by ~540 slots for the prompt (refilled after it, as before).  8K chunks (the 192-slot tier below) gain too: 8K
+// prompt, F16, 192 -> 512 slots 1221 -> 1307 tok/s (+7%), the same tokens; chunks of 6,144 or fewer keep their tier
+// (not measured on this link).  Taken only on a link probed below 20 GB/s
+// (PCIe 3.0 x16, 4.0 x8); STRATA_GFX12_SLOW_LINK_RING=0 keeps the tier depth, =N takes N slots (96..ring_cap()),
+// STRATA_GFX12_SLOW_LINK_GBPS=X moves the threshold.  STRATA_PREFILL_RING still wins.
+inline int gfx12_slow_link_ring() {
+    static const int forced = [] {
+        const char* v = std::getenv("STRATA_GFX12_SLOW_LINK_RING");
+        return v != nullptr && v[0] != '\0' ? std::atoi(v) : -1;
+    }();
+    static const double below = [] {
+        const char* v = std::getenv("STRATA_GFX12_SLOW_LINK_GBPS");
+        const double x = v != nullptr ? std::atof(v) : 0.0;
+        return x > 0.0 ? x : 20.0;
+    }();
+    if (forced == 0 || !(g_link_gbps > 0.0 && g_link_gbps < below)) return 0;
+    const int cap = ring_cap();
+    const int r = std::max(96, std::min(forced > 0 ? forced : cap, cap));
+    if (static bool said = false; !said) {
+        said = true;
+        std::fprintf(stderr, "strata: gfx12: the host link probed %.1f GB/s (below %.0f): prompt chunks of more than 6,144 tokens stream "
+                             "their experts through a %d-slot ring, so a layer's experts arrive while the layer before it computes "
+                             "(STRATA_GFX12_SLOW_LINK_RING=0 turns it off)\n", g_link_gbps, below, r);
+    }
+    return r;
+}
 inline int ring_slots(size_t T) {
     const char* v = std::getenv("STRATA_PREFILL_RING");
 #if defined(STRATA_USE_HIP)
@@ -859,7 +894,12 @@ inline int ring_slots(size_t T) {
             const char* e = std::getenv("STRATA_GFX12_RING");
             return !(e != nullptr && e[0] == '0') && strata::kernels::qsa_prompt_attn_matrix_cores_gfx12();
         }();
-        if (!deeper || (int64_t) T >= 12288) return 96;
+        if (!deeper) return 96;
+        if ((int64_t) T > 6144) {
+            const int slow = gfx12_slow_link_ring();   // a slow host link: the copies need a layer of room (above)
+            if (slow > 0) return slow;
+        }
+        if ((int64_t) T >= 12288) return 96;
         const int64_t per = MAXBLOB();
         const int cap = per > 0 ? (int) std::max<int64_t>(96, (int64_t) (800u << 20) / per) : 96;
         return std::min(cap, (int64_t) T <= 6144 ? 256 : 192);
@@ -3551,6 +3591,7 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
 
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
 void Prefill::set_ring_override(int slots) { g_ring_override = slots > 0 ? slots : 0; }
+void Prefill::set_link_gbps(double gbps) { g_link_gbps = gbps > 0.0 ? gbps : 0.0; }
 void Prefill::set_ring_budget(int slots, int64_t small_max) {
     g_ring_budget = slots > 0 ? slots : 0;
     g_ring_small_max = small_max > 0 ? small_max : 0;

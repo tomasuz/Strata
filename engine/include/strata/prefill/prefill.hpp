@@ -145,6 +145,10 @@ public:
     /// #340: the streamed ring's slot count for chunks that stream every expert, instead of the pinned-share rule
     /// (0 = that rule). Set before any `bytes_needed`/`init` (both count the ring); STRATA_PREFILL_RING still wins.
     static void set_ring_override(int slots);
+    /// The start-up host -> device probe in GB/s (0 = not probed).  A gfx12 card on a link below 20 GB/s streams the
+    /// experts of 12K+ chunks through a ring of one layer's experts (prefill.cpp gfx12_slow_link_ring).  Set before any
+    /// `bytes_needed`/`init`, like set_ring_override.
+    static void set_link_gbps(double gbps);
     /// #583: the auto chunk scan's byte-budget ring, for chunks above `small_max` (0.1.39's auto chunk: a prompt that
     /// fits it keeps 0.1.39's ring).  0 slots = none.  A layer split's set_ring_override and STRATA_PREFILL_RING win.
     static void set_ring_budget(int slots, int64_t small_max);
